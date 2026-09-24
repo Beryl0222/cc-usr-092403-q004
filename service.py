@@ -75,6 +75,17 @@ def build_actions(system: ReviewSystem):
             return _jsonable(method(**data))
         return action
 
+    def with_dates(*names):
+        def wrap(method):
+            def action(payload):
+                data = dict(payload)
+                for name in names:
+                    if name in data:
+                        data[name] = _parse_date(data.get(name))
+                return _jsonable(method(**data))
+            return action
+        return wrap
+
     return {
         "register_source": with_license(system.register_source),
         "revise_source": with_license(system.revise_source),
@@ -96,6 +107,25 @@ def build_actions(system: ReviewSystem):
         "page_blockers": call(system.page_blockers),
         "panel_trace": call(system.panel_trace),
         "export_batch": call(system.export_batch),
+        # 海外发行主线
+        "create_market_rule": with_dates("effective_at")(system.create_market_rule),
+        "new_rule_version": with_dates("effective_at")(system.new_rule_version),
+        "create_partner": with_dates("expires_at", "effective_at")(system.create_partner),
+        "new_partner_version": with_dates("expires_at", "effective_at")(
+            system.new_partner_version),
+        "create_window": with_dates("opens_at", "closes_at", "effective_at")(
+            system.create_window),
+        "new_window_version": with_dates("opens_at", "closes_at", "effective_at")(
+            system.new_window_version),
+        "issue_embargo": with_dates("effective_at")(system.issue_embargo),
+        "lift_embargo": with_dates("lifted_at")(system.lift_embargo),
+        "create_release_batch": with_dates("on")(system.create_release_batch),
+        "publish_batch": with_dates("on")(system.publish_batch),
+        "provide_alternative": call(system.provide_alternative),
+        "record_receipt": with_dates("effective_at")(system.record_receipt),
+        "recalculate_batch": with_dates("on")(system.recalculate_batch),
+        "batch_trace": call(system.batch_trace),
+        "export_release": with_dates("on")(system.export_release),
     }
 
 
@@ -168,7 +198,10 @@ def main():
     if args.check:
         assert health_payload()["service"] == SERVICE_ID
         smoke = ReviewSystem()
-        assert "sign_opinion" in build_actions(smoke)
+        actions = build_actions(smoke)
+        assert "sign_opinion" in actions
+        assert "create_release_batch" in actions
+        assert "export_release" in actions
         print("基础检查通过")
         return
     ThreadingHTTPServer(("0.0.0.0", args.port), Handler).serve_forever()
