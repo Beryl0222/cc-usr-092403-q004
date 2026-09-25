@@ -216,6 +216,22 @@ class ReviewSystem:
         self.pages: dict[str, Page] = {}
         self.opinions: dict[str, Opinion] = {}
         self.issues: dict[str, Issue] = {}
+        # 史料许可修订时间线(含生效时间), 供发行域按生效时间重算
+        self.source_revision_log: dict[str, list] = {}
+        self._event_seq = count(1)  # 全局事件序号: 同一生效时间按到达顺序裁决
+        self._listeners = []  # 领域变更监听器(发行域借此重算未完结批次)
+
+    def next_event_seq(self) -> int:
+        """分配全局事件序号(跨事件类型可比, 用于生效时间相同时的裁决)。"""
+        return next(self._event_seq)
+
+    def add_listener(self, listener):
+        """登记领域变更监听器; 关键改稿/状态操作完成后触发。"""
+        self._listeners.append(listener)
+
+    def _touch(self):
+        for listener in self._listeners:
+            listener()
 
     # ----- 基础设施 -----
 
@@ -250,10 +266,14 @@ class ReviewSystem:
         )
         source.history.append(f"{self._now().isoformat()} {actor} 登记史料")
         self.sources[source.id] = source
+        self.source_revision_log[source.id] = [
+            {"revision": 1, "license": license, "effective_at": self._now(),
+             "seq": self.next_event_seq()}]
         return source
 
     def revise_source(self, source_id: str, *, citation: str, license: License,
-                      actor: str, role: str, base_revision: int) -> HistoricalSource:
+                      actor: str, role: str, base_revision: int,
+                      effective_at: datetime | None = None) -> HistoricalSource:
         self._require_editor(role)
         source = self._get(self.sources, source_id, "史料")
         if base_revision != source.revision:
@@ -262,7 +282,13 @@ class ReviewSystem:
         source.citation = citation
         source.license = license
         source.revision += 1
+        self.source_revision_log[source_id].append({
+            "revision": source.revision, "license": license,
+            "effective_at": effective_at or self._now(),
+            "seq": self.next_event_seq(),
+        })
         source.history.append(f"{self._now().isoformat()} {actor} 修订至r{source.revision}")
+        self._touch()
         return source
 
     # ----- 脚本段落 -----
@@ -357,9 +383,11 @@ class ReviewSystem:
             raise StaleVersionError(
                 f"分镜页{page_id}当前为v{page.current.version}, "
                 f"基于v{base_version}的修改被拒绝")
-        return self._append_page_version(
+        version = self._append_page_version(
             page, script_refs=script_refs, design_refs=design_refs,
             source_refs=source_refs, actor=actor)
+        self._touch()
+        return version
 
     def add_panel(self, page_id: str, *, page_version: int, index: int,
                   sketch_ref: str, actor: str) -> Panel:
@@ -424,6 +452,7 @@ class ReviewSystem:
         opinion.decided_by = actor
         opinion.history.append(f"{self._now().isoformat()} {actor} 采纳")
         self._detect_conflict(opinion)
+        self._touch()
         return opinion
 
     def reject_opinion(self, opinion_id: str, *, actor: str, role: str) -> Opinion:
@@ -509,6 +538,7 @@ class ReviewSystem:
         issue.decision = decision
         issue.decided_by = actor
         issue.history.append(f"{self._now().isoformat()} {actor} 关闭: {decision}")
+        self._touch()
         return issue
 
     def submit_objection(self, issue_id: str, *, content: str, evidence: str,
@@ -537,6 +567,7 @@ class ReviewSystem:
         else:
             issue.history.append(
                 f"{self._now().isoformat()} {actor} 提交异议{objection.id}")
+        self._touch()
         return objection
 
     # ----- 页面状态机与交付门禁 -----
@@ -560,6 +591,11 @@ class ReviewSystem:
                 continue
             result.append(issue)
         return result
+
+    def open_fact_issues(self, page_id: str) -> list:
+        """页面(含其当前版本依赖)未关闭的史实议题; 供发行域恢复与导出检查。"""
+        page = self._get(self.pages, page_id, "分镜页")
+        return self._open_issues_for_page(page, fact_only=True)
 
     def _stale_dependencies(self, page: Page) -> list[str]:
         current = page.current
@@ -618,6 +654,7 @@ class ReviewSystem:
                 raise StateError("页面不可交付, 不能转入可出版: " + "; ".join(blockers))
         page.status = target
         page.history.append(f"{self._now().isoformat()} {actor} 转入「{target}」")
+        self._touch()
         return page
 
     # ----- 追溯与导出 -----

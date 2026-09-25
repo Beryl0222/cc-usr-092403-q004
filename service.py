@@ -18,6 +18,7 @@ from domain import (
     ReviewSystem,
     StaleVersionError,
 )
+from release import PartnerGrant, ReleaseSystem
 
 SERVICE_ID = "storyboard-review"
 SERVICE_NAME = "连环画创作审稿"
@@ -48,6 +49,12 @@ def _parse_date(value):
     return date.fromisoformat(value)
 
 
+def _parse_datetime(value):
+    if value in (None, ""):
+        return None
+    return datetime.fromisoformat(value)
+
+
 def _parse_license(payload):
     if payload is None:
         raise DomainError("缺少 license 字段")
@@ -58,7 +65,19 @@ def _parse_license(payload):
     )
 
 
-def build_actions(system: ReviewSystem):
+def _parse_grants(payload):
+    grants = []
+    for item in payload or []:
+        grants.append(PartnerGrant(
+            partner=item.get("partner"),
+            markets=frozenset(item.get("markets") or []),
+            valid_from=_parse_date(item.get("valid_from")),
+            valid_to=_parse_date(item.get("valid_to")),
+        ))
+    return grants
+
+
+def build_actions(system: ReviewSystem, release: ReleaseSystem | None = None):
     """把领域操作映射为可远程调用的 action 表。"""
 
     def call(method, **bound):
@@ -72,10 +91,21 @@ def build_actions(system: ReviewSystem):
         def action(payload):
             data = dict(payload)
             data["license"] = _parse_license(data.get("license"))
+            if "effective_at" in data:
+                data["effective_at"] = _parse_datetime(data.get("effective_at"))
             return _jsonable(method(**data))
         return action
 
-    return {
+    def with_conversions(method, **converters):
+        def action(payload):
+            data = dict(payload)
+            for key, convert in converters.items():
+                if key in data:
+                    data[key] = convert(data[key])
+            return _jsonable(method(**data))
+        return action
+
+    actions = {
         "register_source": with_license(system.register_source),
         "revise_source": with_license(system.revise_source),
         "create_segment": call(system.create_segment),
@@ -97,6 +127,28 @@ def build_actions(system: ReviewSystem):
         "panel_trace": call(system.panel_trace),
         "export_batch": call(system.export_batch),
     }
+    if release is not None:
+        actions.update({
+            "register_market_rule": with_conversions(
+                release.register_market_rule, effective_at=_parse_datetime),
+            "register_embargo": with_conversions(
+                release.register_embargo, effective_at=_parse_datetime),
+            "lift_embargo": with_conversions(
+                release.lift_embargo, effective_at=_parse_datetime),
+            "create_release_batch": with_conversions(
+                release.create_release_batch,
+                window_start=_parse_date, window_end=_parse_date,
+                partner_grants=_parse_grants),
+            "append_replacement": with_conversions(
+                release.append_replacement, effective_at=_parse_datetime),
+            "record_receipt": with_conversions(
+                release.record_receipt, effective_at=_parse_datetime),
+            "close_batch": call(release.close_batch),
+            "export_delivery": with_conversions(
+                release.export_delivery, on=_parse_date),
+            "batch_trace": call(release.batch_trace),
+        })
+    return actions
 
 
 ERROR_STATUS = {
@@ -106,8 +158,8 @@ ERROR_STATUS = {
 }
 
 
-def make_handler(system: ReviewSystem):
-    actions = build_actions(system)
+def make_handler(system: ReviewSystem, release: ReleaseSystem | None = None):
+    actions = build_actions(system, release)
 
     class Handler(BaseHTTPRequestHandler):
         """健康检查与领域操作入口。"""
@@ -157,7 +209,8 @@ def make_handler(system: ReviewSystem):
 
 
 SYSTEM = ReviewSystem()
-Handler = make_handler(SYSTEM)
+RELEASE = ReleaseSystem(SYSTEM)
+Handler = make_handler(SYSTEM, RELEASE)
 
 
 def main():
@@ -168,7 +221,8 @@ def main():
     if args.check:
         assert health_payload()["service"] == SERVICE_ID
         smoke = ReviewSystem()
-        assert "sign_opinion" in build_actions(smoke)
+        actions = build_actions(smoke, ReleaseSystem(smoke))
+        assert "sign_opinion" in actions and "create_release_batch" in actions
         print("基础检查通过")
         return
     ThreadingHTTPServer(("0.0.0.0", args.port), Handler).serve_forever()

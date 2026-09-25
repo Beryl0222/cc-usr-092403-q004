@@ -8,6 +8,7 @@ from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 from domain import ReviewSystem
+from release import ReleaseSystem
 from service import make_handler
 
 
@@ -131,6 +132,138 @@ class ApiTest(unittest.TestCase):
         })
         self.assertEqual(status, 409)
         self.assertEqual(body["kind"], "StaleVersionError")
+
+
+class ReleaseApiTest(unittest.TestCase):
+    """发行域(批次/禁运/导出/反查)的 HTTP 端到端行为。"""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.review = ReviewSystem()
+        cls.release = ReleaseSystem(cls.review)
+        cls.server = ThreadingHTTPServer(
+            ("127.0.0.1", 0), make_handler(cls.review, cls.release))
+        cls.thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
+        cls.thread.start()
+        cls.base_url = f"http://127.0.0.1:{cls.server.server_port}"
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.server.shutdown()
+        cls.server.server_close()
+        cls.thread.join(timeout=2)
+
+    def call(self, action, payload=None):
+        request = Request(
+            f"{self.base_url}/api/{action}",
+            data=json.dumps(payload or {}).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            with urlopen(request, timeout=2) as response:
+                return response.status, json.load(response)
+        except HTTPError as error:
+            return error.code, json.load(error)
+
+    def _seed_publishable_page(self):
+        _, source = self.call("register_source", {
+            "title": "战斗详报", "citation": "《战史》p12",
+            "license": {"publication_scopes": ["东南亚", "欧洲"]},
+            "actor": "王编辑", "role": "编辑",
+        })
+        _, segment = self.call("create_segment", {
+            "title": "夜袭", "text": "拂晓进入阵地。", "actor": "学员甲",
+        })
+        _, design = self.call("create_design", {
+            "name": "连长", "brief": "三十岁。", "actor": "学员甲",
+        })
+        _, page = self.call("create_page", {
+            "title": "第3页",
+            "script_refs": {segment["id"]: 1},
+            "design_refs": {design["id"]: 1},
+            "source_refs": {source["id"]: 1},
+            "actor": "学员甲",
+        })
+        for target in ("待评审", "精稿中", "可出版"):
+            status, _ = self.call("transition_page", {
+                "page_id": page["id"], "target": target,
+                "actor": "王编辑", "role": "编辑",
+            })
+            self.assertEqual(status, 200, target)
+        return source, page
+
+    def test_release_flow_over_http(self):
+        source, page = self._seed_publishable_page()
+        status, _ = self.call("register_market_rule", {
+            "market": "东南亚", "banned_sources": [], "note": "初版规则",
+            "actor": "林经理", "role": "发行经理",
+        })
+        self.assertEqual(status, 200)
+        status, batch = self.call("create_release_batch", {
+            "title": "海外首批", "markets": ["东南亚"],
+            "window_start": "2026-10-01", "window_end": "2026-12-31",
+            "page_ids": [page["id"]],
+            "partner_grants": [{"partner": "合作方甲", "markets": ["东南亚"],
+                                "valid_from": "2026-01-01"}],
+            "actor": "林经理", "role": "发行经理",
+        })
+        self.assertEqual(status, 200, batch)
+        batch_id = batch["id"]
+        self.assertEqual(batch["entries"][0]["page_version"], 1)
+
+        # 禁运生效(合作方已下载后): 导出立即排除该素材
+        status, embargo = self.call("register_embargo", {
+            "market": "东南亚", "source_ids": [source["id"]],
+            "reason": "地区禁运通知", "message_id": "emb-1",
+            "actor": "林经理", "role": "发行经理",
+        })
+        self.assertEqual(status, 200)
+        status, result = self.call("export_delivery", {
+            "batch_id": batch_id, "partner": "合作方甲", "market": "东南亚",
+            "actor": "林经理", "role": "发行经理",
+        })
+        self.assertEqual(status, 200)
+        self.assertEqual(result["pages"], [])
+        self.assertIn(page["id"], result["excluded"])
+
+        # 同一消息重放: 不重复登记, 不重复通知
+        status, replay = self.call("register_embargo", {
+            "market": "东南亚", "source_ids": [source["id"]],
+            "reason": "地区禁运通知", "message_id": "emb-1",
+            "actor": "林经理", "role": "发行经理",
+        })
+        self.assertEqual(status, 200)
+        self.assertEqual(replay["id"], embargo["id"])
+        _, trace = self.call("batch_trace", {"batch_id": batch_id})
+        self.assertEqual(len(trace["notices"]), 1)
+        self.assertEqual(trace["notices"][0]["kind"], "撤回")
+
+        # 解禁后恢复导出, 首次成功导出自动登记「已下载」
+        status, _ = self.call("lift_embargo", {
+            "embargo_id": embargo["id"], "actor": "林经理", "role": "发行经理",
+        })
+        self.assertEqual(status, 200)
+        status, result = self.call("export_delivery", {
+            "batch_id": batch_id, "partner": "合作方甲", "market": "东南亚",
+            "actor": "林经理", "role": "发行经理",
+        })
+        self.assertEqual([p["page_id"] for p in result["pages"]], [page["id"]])
+        _, trace = self.call("batch_trace", {"batch_id": batch_id})
+        self.assertEqual(trace["partners"][0]["last_step"], "已下载")
+        self.assertEqual(trace["entries"][0]["frozen_version"], 1)
+        self.assertEqual(trace["licenses"][source["id"]]["revision"], 1)
+
+    def test_release_ops_require_manager_role_over_http(self):
+        _, page = self._seed_publishable_page()
+        status, body = self.call("create_release_batch", {
+            "title": "越权批次", "markets": ["东南亚"],
+            "window_start": "2026-10-01", "window_end": "2026-12-31",
+            "page_ids": [page["id"]], "partner_grants": [],
+            "actor": "王编辑", "role": "编辑",
+        })
+        self.assertEqual(status, 403)
+        self.assertEqual(body["kind"], "PermissionDenied")
 
 
 if __name__ == "__main__":

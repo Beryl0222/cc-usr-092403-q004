@@ -27,6 +27,26 @@
 - **并发与乱序**:所有改稿操作携带 `base_version`/`base_revision` 做乐观并发
   校验(`StaleVersionError`);针对旧版本的迟到点评保留并标记 `outdated`。
 
+## 发行与禁运(release.py)
+
+- **批次冻结**:发布批次冻结所采用的页面版本、史料许可(修订号与条款)、发行窗口、
+  合作方授权与市场规则版本;冻结后不改写原清单,只追加撤回通知、合作方回执与替代版本。
+- **禁运与许可收缩**:禁运按市场+素材命中,许可收缩只影响失去覆盖的市场与引用该史料的
+  页面;其他市场与素材不受影响,既有批次保留原清单。
+- **生效时间重算**:禁运/解禁、许可修订(`revise_source` 可带 `effective_at`)、规则版本、
+  替代版本均携带生效时间;乱序到达时未完结批次按生效时间重算每个 (市场, 页面) 单元——
+  某时刻单元被撤回,当且仅当该时刻存在生效中的撤回原因,因此旧消息不会复活已撤回内容。
+- **更正不误恢复**:解禁时若页面已被更正(冻结版本陈旧)且未追加替代版本,单元保持
+  已撤回;追加替代版本后按替代版本恢复(通知类型为「替换」)。
+- **幂等通知**:通知按 (批次, 市场, 页面, 撤回区间, 合作方) 的确定性键去重;
+  各发行操作接受 `message_id`,重放同一消息或重算同一批次不会产生重复通知。
+- **导出与反查**:`export_delivery` 只返回当前范围确实允许的材料(单元状态、页面状态、
+  事实争议、当前许可、当前禁运与规则、合作方授权逐项检查),首次成功导出自动登记
+  合作方「已下载」回执;`batch_trace` 反查冻结清单、许可与规则依据、通知/替代/回执,
+  以及每个合作方最后确认到了哪一步(迟到回执按生效时间归位,不会拉低进度)。
+- **完结**:`close_batch` 要求所有撤回通知均已被合作方确认(已收讫/已下架/已替换);
+  已完结批次不再重算,迟到的回执仍可补录。发行操作仅「发行经理」角色可执行。
+
 ## HTTP 接口
 
 `POST /api/<action>`,JSON 请求与响应。action 与领域方法一一对应:
@@ -34,7 +54,10 @@
 `create_design`、`new_design_version`、`create_page`、`new_page_version`、
 `add_panel`、`sign_opinion`、`adopt_opinion`、`reject_opinion`、
 `withdraw_opinion`、`delete_opinion`、`close_issue`、`submit_objection`、
-`transition_page`、`page_blockers`、`panel_trace`、`export_batch`。
+`transition_page`、`page_blockers`、`panel_trace`、`export_batch`,
+以及发行域的 `register_market_rule`、`register_embargo`、`lift_embargo`、
+`create_release_batch`、`append_replacement`、`record_receipt`、`close_batch`、
+`export_delivery`、`batch_trace`。
 
 错误映射:404 对象不存在,403 越权,409 版本冲突,400 其他领域规则或请求格式错误。
 
